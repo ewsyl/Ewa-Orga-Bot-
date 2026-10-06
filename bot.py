@@ -9,6 +9,7 @@ import asyncio
 import base64
 import datetime as dt
 import html
+import json
 import logging
 import os
 import uuid
@@ -192,10 +193,8 @@ def list_unread_mails(limit: int = 20) -> list:
 # ---------------------------------------------------------------------------
 # Claude: Termine aus Foto/Text erkennen
 # ---------------------------------------------------------------------------
-EXTRACT_TOOL = {
-    "name": "termine_erfassen",
-    "description": "Gibt die erkannten Termine strukturiert zurueck.",
-    "input_schema": {
+# JSON-Schema fuer Structured Outputs (Claude antwortet garantiert in diesem Format)
+TERMINE_SCHEMA = {
         "type": "object",
         "properties": {
             "termine": {
@@ -211,7 +210,8 @@ EXTRACT_TOOL = {
                         "ort": {"type": ["string", "null"], "description": "Adresse oder Ort, so genau wie moeglich"},
                         "beschreibung": {"type": ["string", "null"], "description": "Nuetzliche Zusatzinfos (Eintritt, Hinweise, Website)"},
                     },
-                    "required": ["titel", "start_datum"],
+                    "required": ["titel", "start_datum", "start_zeit", "end_datum", "end_zeit", "ort", "beschreibung"],
+                    "additionalProperties": False,
                 },
             },
             "hinweis": {
@@ -219,8 +219,8 @@ EXTRACT_TOOL = {
                 "description": "Kurzer Hinweis an Ewa, falls etwas unklar war (z. B. Jahr geraten). Sonst null.",
             },
         },
-        "required": ["termine"],
-    },
+        "required": ["termine", "hinweis"],
+        "additionalProperties": False,
 }
 
 
@@ -249,23 +249,20 @@ async def extract_events(text: str | None, image_b64: str | None, media_type: st
         content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}})
     prompt = text or "Bitte trag den Termin von diesem Bild ein."
     if draft:
-        import json
-
         prompt = f"Bisheriger Entwurf:\n{json.dumps(draft, ensure_ascii=False)}\n\nEwas Nachricht:\n{prompt}"
     content.append({"type": "text", "text": prompt})
 
     resp = await claude.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1500,
+        max_tokens=16000,
         system=_system_prompt(),
-        tools=[EXTRACT_TOOL],
-        tool_choice={"type": "tool", "name": "termine_erfassen"},
+        output_config={"effort": "low", "format": {"type": "json_schema", "schema": TERMINE_SCHEMA}},
         messages=[{"role": "user", "content": content}],
     )
-    for block in resp.content:
-        if block.type == "tool_use":
-            return block.input
-    return {"termine": [], "hinweis": "Ich konnte nichts erkennen."}
+    text = next((b.text for b in resp.content if b.type == "text"), "")
+    if not text:
+        return {"termine": [], "hinweis": "Ich konnte nichts erkennen."}
+    return json.loads(text)
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +488,8 @@ async def summarize_mails(mails: list) -> str:
     liste = "\n".join(f"- Von: {m['von']} | Betreff: {m['betreff']} | {m['vorschau']}" for m in mails)
     resp = await claude.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=600,
+        max_tokens=8000,
+        output_config={"effort": "low"},
         system=(
             "Du fasst Ewas ungelesene Mails fuer ihre Morgenuebersicht zusammen. Deutsch, knapp. "
             "Nenne hoechstens 5 wirklich wichtige Mails (Kunden, Team, Termine, Zahlungen, Fristen) "
