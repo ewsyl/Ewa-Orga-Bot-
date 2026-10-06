@@ -14,9 +14,12 @@ import os
 import uuid
 from zoneinfo import ZoneInfo
 
+import anthropic
 from anthropic import AsyncAnthropic
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -49,11 +52,35 @@ SCOPES = [
 ]
 
 WOCHENTAGE = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+DANKE_WORTE = {"danke", "dankeschön", "danke schön", "vielen dank", "danke dir", "merci", "super", "ok", "okay", "top", "👍"}
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("orga-bot")
 
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def fehlergrund(exc: Exception) -> str:
+    """Uebersetzt typische API-Fehler in einen verstaendlichen Hinweis fuer Telegram."""
+    text = str(exc)
+    low = text.lower()
+    if isinstance(exc, anthropic.AuthenticationError):
+        return "Claude-API-Key ungültig → ANTHROPIC_API_KEY in Railway prüfen."
+    if isinstance(exc, anthropic.APIStatusError) and "credit balance" in low:
+        return "Claude-Guthaben leer → console.anthropic.com → Billing aufladen."
+    if isinstance(exc, anthropic.NotFoundError):
+        return f"Claude-Modell nicht gefunden → CLAUDE_MODEL prüfen (aktuell: {CLAUDE_MODEL})."
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "Claude gerade nicht erreichbar → gleich nochmal probieren."
+    if isinstance(exc, RefreshError):
+        return "Google-Verbindung abgelaufen → neuen Refresh-Token holen (Anleitung Schritt 3d)."
+    if isinstance(exc, HttpError):
+        if "accessNotConfigured" in text or "has not been used" in text or "is disabled" in text:
+            return "Gmail API ist im Google-Projekt nicht aktiviert → Anleitung Schritt 3a."
+        if "insufficient" in low or "scope" in low:
+            return "Google-Token hat keine Gmail-Berechtigung → Schritt 3d mit beiden Scopes wiederholen."
+        return f"Google-Fehler {exc.resp.status}."
+    return f"{type(exc).__name__}: {text[:150]}"
 
 
 # ---------------------------------------------------------------------------
@@ -371,15 +398,20 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_b64 = base64.b64encode(bytes(await file.download_as_bytearray())).decode()
         media_type = msg.document.mime_type
 
+    # Kurzes Danke & Co. braucht keinen Claude-Aufruf
+    if not image_b64 and (text or "").strip().lower().strip("!.😊🙏 ") in DANKE_WORTE:
+        await msg.reply_text("Gerne! 😊")
+        return
+
     # Bei reinem Text: letzten offenen Entwurf mitgeben, damit Korrekturen funktionieren
     draft = context.user_data.get("last_draft") if not image_b64 else None
 
     await context.bot.send_chat_action(msg.chat_id, "typing")
     try:
         result = await extract_events(text, image_b64, media_type, draft)
-    except Exception:
+    except Exception as exc:
         log.exception("Claude-Fehler")
-        await msg.reply_text("Da ist gerade was schiefgelaufen beim Lesen. Probier's bitte nochmal.")
+        await msg.reply_text(f"Da ist gerade was schiefgelaufen beim Lesen.\n⚠️ {fehlergrund(exc)}")
         return
 
     termine = result.get("termine") or []
@@ -485,10 +517,18 @@ async def send_overview_to(bot, chat_id: int):
 
     try:
         mails = await asyncio.to_thread(list_unread_mails)
-        mail_text = html.escape(await summarize_mails(mails))
-    except Exception:
+    except Exception as exc:
         log.exception("Gmail-Fehler")
-        mail_text = "⚠️ Mails konnten nicht geladen werden."
+        mails = None
+        mail_text = f"⚠️ Mails konnten nicht geladen werden.\n{html.escape(fehlergrund(exc))}"
+    if mails is not None:
+        try:
+            mail_text = html.escape(await summarize_mails(mails))
+        except Exception as exc:
+            # Claude streikt -> wenigstens die Betreffzeilen zeigen
+            log.exception("Claude-Fehler (Mail-Zusammenfassung)")
+            liste = "\n".join(f"• {m['von'].split('<')[0].strip()} – {m['betreff']}" for m in mails[:8])
+            mail_text = html.escape(liste) + f"\n<i>(Zusammenfassung nicht möglich: {html.escape(fehlergrund(exc))})</i>"
     teile.append(f"<b>📬 Postfach</b>\n{mail_text}")
 
     await bot.send_message(chat_id, "\n\n".join(teile), parse_mode=ParseMode.HTML)
